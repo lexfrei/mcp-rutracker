@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+
+	"github.com/lexfrei/mcp-rutracker/internal/torrentmeta"
 )
 
 // DefaultBaseURL is the canonical rutracker forum root. Mirrors such as
@@ -32,6 +34,8 @@ type Client interface {
 	DownloadTorrent(ctx context.Context, topicID int) (*TorrentFile, error)
 	// Magnet resolves the magnet link for a topic.
 	Magnet(ctx context.Context, topicID int) (string, error)
+	// TorrentFiles downloads and decodes the topic's .torrent into its file list.
+	TorrentFiles(ctx context.Context, topicID int) (*torrentmeta.Meta, error)
 }
 
 // Options configures a Scraper. Either Cookie or Username+Password must be set

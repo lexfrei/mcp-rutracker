@@ -63,8 +63,8 @@ const captchaPageHTML = `<html><body><form id="login-form" action="login.php" me
 <img src="/captcha/12345.jpg"><input name="cap_sid" value="abc"><input name="cap_code_xyz">
 <input name="login_username"><input type="submit" name="login" value="Вход"></form></body></html>`
 
-// torrentBytes is a minimal bencoded payload that begins with a dict marker.
-var torrentBytes = []byte("d8:announce0:4:infod6:lengthi100e4:name4:teste e")
+// torrentBytes is a minimal but valid single-file bencoded .torrent.
+var torrentBytes = []byte("d4:infod6:lengthi1024e4:name8:file.txt12:piece lengthi16384eee")
 
 // mockServer is a configurable rutracker stand-in for tests.
 type mockServer struct {
@@ -433,6 +433,34 @@ func TestDownloadTorrent_NonBencodeIsAuthError(t *testing.T) {
 	_, err := scraper.DownloadTorrent(t.Context(), testTopicID)
 	if !errors.Is(err, ErrNotAuthenticated) {
 		t.Fatalf("expected ErrNotAuthenticated for non-bencode, got %v", err)
+	}
+}
+
+func TestTorrentFiles_ParsesFileList(t *testing.T) {
+	t.Parallel()
+
+	mock := newMockServer(t)
+	scraper := mock.newScraper(t, &Options{Cookie: testSession})
+
+	meta, err := scraper.TorrentFiles(t.Context(), testTopicID)
+	if err != nil {
+		t.Fatalf("TorrentFiles: %v", err)
+	}
+
+	if meta.Name != "file.txt" {
+		t.Errorf("Name = %q, want file.txt", meta.Name)
+	}
+
+	if meta.FileCount != 1 || meta.Files[0].SizeBytes != 1024 {
+		t.Errorf("files = %+v, want one 1024-byte file", meta.Files)
+	}
+
+	if meta.TotalSizeBytes != 1024 {
+		t.Errorf("TotalSizeBytes = %d, want 1024", meta.TotalSizeBytes)
+	}
+
+	if len(meta.InfoHash) != 40 {
+		t.Errorf("InfoHash = %q, want 40 hex chars", meta.InfoHash)
 	}
 }
 
