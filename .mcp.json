@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "mcp-rutracker": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "RUTRACKER_USERNAME",
+        "-e", "RUTRACKER_PASSWORD",
+        "-e", "RUTRACKER_COOKIE",
+        "-e", "RUTRACKER_BASE_URL",
+        "-v", "mcp-rutracker-session:/home/nobody/.mcp-rutracker",
+        "ghcr.io/lexfrei/mcp-rutracker:latest"
+      ],
+      "env": {
+        "RUTRACKER_USERNAME": "",
+        "RUTRACKER_PASSWORD": ""
+      }
+    }
+  }
+}
