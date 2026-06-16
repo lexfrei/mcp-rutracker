@@ -2,6 +2,18 @@
 
 MCP server for [RuTracker](https://rutracker.org). Search torrents, inspect topics, list the files inside a torrent without downloading it, resolve magnet links, and download `.torrent` files — all from any MCP-compatible client.
 
+## Why another one?
+
+There are already several RuTracker MCP servers. This one exists because I wanted a particular set of features, wanted it in Go, and — honestly — a fair bit of not-invented-here. So it leans into a few things the alternatives don't.
+
+## Highlights
+
+- File listing **without downloading the `.torrent`** — the cheap `viewtorrent.php` endpoint, with exact per-file sizes.
+- Mirror round-robin over `rutracker.org` / `rutracker.net` with automatic failover on network and `5xx` errors.
+- Canonical info-hash computed from the torrent's own bencode (and parsed from magnet links).
+- windows-1251 handling in both directions, and a small self-contained bencode decoder.
+- Distroless multi-arch container image, signed with cosign.
+
 ## Features
 
 - **rutracker_search** — search torrents by keywords, optionally restricted to a forum and sorted by seeders, size, date, or downloads. Each result carries the topic ID, title, forum, exact size, seeders/leechers, downloads, author, and date.
@@ -84,6 +96,10 @@ RUTRACKER_LIVE=1 RUTRACKER_USERNAME=... RUTRACKER_PASSWORD=... \
   RUTRACKER_BASE_URL=https://rutracker.net/forum/ \
   go test -run TestLive -count=1 ./internal/rutracker/
 ```
+
+## See also
+
+Other RuTracker MCP servers worth knowing about: [Zhurik/rutracker-mcp](https://github.com/Zhurik/rutracker-mcp), [carrysauce/rutracker-mcp-server](https://github.com/carrysauce/rutracker-mcp-server), [wildcar/rutracker-torrent-mcp](https://github.com/wildcar/rutracker-torrent-mcp), and [pgagarinov/cc-rutracker-mcp](https://github.com/pgagarinov/cc-rutracker-mcp).
 
 ## License
 
