@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -9,6 +10,11 @@ import (
 	"github.com/lexfrei/mcp-rutracker/internal/config"
 	"github.com/lexfrei/mcp-rutracker/internal/rutracker"
 )
+
+// testLogger discards log output to keep test runs quiet.
+func testLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
 
 func TestRequireCredentials(t *testing.T) {
 	t.Parallel()
@@ -34,7 +40,7 @@ func TestRegisterTools_ListsAllTools(t *testing.T) {
 		t.Fatalf("rutracker.New: %v", err)
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: "test"}, newServerOptions())
+	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: "test"}, newServerOptions(testLogger()))
 	registerTools(server, client, "")
 
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
@@ -86,8 +92,12 @@ func TestRegisterTools_ListsAllTools(t *testing.T) {
 func TestNewServerOptions_HasInstructions(t *testing.T) {
 	t.Parallel()
 
-	opts := newServerOptions()
+	opts := newServerOptions(testLogger())
 	if opts.Instructions == "" {
 		t.Error("server instructions must not be empty")
+	}
+
+	if opts.Logger == nil {
+		t.Error("server logger must be set")
 	}
 }
