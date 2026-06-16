@@ -9,7 +9,7 @@ import (
 // cleanText normalises scraped text: non-breaking spaces become regular spaces
 // and runs of whitespace collapse to one.
 func cleanText(text string) string {
-	text = strings.ReplaceAll(text, " ", " ")
+	text = strings.ReplaceAll(text, "\u00a0", " ")
 
 	return strings.Join(strings.Fields(text), " ")
 }
@@ -77,9 +77,9 @@ func forumIDFromHref(href string) int {
 	return atoiSafe(parsed.Query().Get("f"))
 }
 
-// magnetInfoHash returns the upper-case BitTorrent info-hash inside a magnet
-// URI's xt=urn:btih:<hash> parameter.
-func magnetInfoHash(magnet string) string {
+// MagnetInfoHash returns the upper-case BitTorrent info-hash inside a magnet
+// URI's xt=urn:btih:<hash> parameter, or "" when absent.
+func MagnetInfoHash(magnet string) string {
 	parsed, err := url.Parse(magnet)
 	if err != nil {
 		return ""

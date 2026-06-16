@@ -2,15 +2,17 @@ package rutracker
 
 import (
 	"crypto/tls"
-	"errors"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/transform"
 )
@@ -51,6 +53,7 @@ const searchHTML = `<html><body><table id="tor-tbl"><tbody>
 </tbody></table></body></html>`
 
 const topicHTML = `<html><body>
+<div class="nav pad_8"><a href="index.php">RuTracker.org</a> » <a href="viewforum.php?f=1457">Зарубежное кино (UHD Video)</a></div>
 <h1 class="maintitle"><a id="topic-title" class="topic-title-6543210" href="https://rutracker.org/forum/viewtopic.php?t=6543210">Матрица / The Matrix (1999) BDRemux</a></h1>
 <a href="magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01&amp;tr=http%3A%2F%2Fbt.t-ru.org%2Fann" class="med magnet-link">Скачать по magnet-ссылке</a>
 <span id="tor-size-humn" title="32212254720">30&nbsp;GB</span>
@@ -83,9 +86,11 @@ var torrentBytes = []byte("d4:infod6:lengthi1024e4:name8:file.txt12:piece length
 
 // mockServer is a configurable rutracker stand-in for tests.
 type mockServer struct {
-	server      *httptest.Server
-	loginCount  int
-	trackerHits int
+	server *httptest.Server
+	// Counters are written from concurrent HTTP handler goroutines, so they are
+	// atomic to keep the mock race-free under the concurrency tests.
+	loginCount  atomic.Int32
+	trackerHits atomic.Int32
 
 	// loginIssuesCookie controls whether a POST to login.php sets bb_session.
 	loginIssuesCookie bool
@@ -98,6 +103,9 @@ type mockServer struct {
 	downloadReturnsHTML bool
 	// emptyFileTree makes viewtorrent.php return a present-but-empty ftree.
 	emptyFileTree bool
+	// topicNoTitle makes viewtopic.php return a 200 body without a topic title,
+	// as an anti-bot interstitial would.
+	topicNoTitle bool
 }
 
 func newMockServer(t *testing.T) *mockServer {
@@ -125,7 +133,7 @@ func (m *mockServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m.loginCount++
+	m.loginCount.Add(1)
 
 	if m.loginIssuesCookie {
 		http.SetCookie(w, &http.Cookie{Name: "bb_session", Value: "server-issued-session", Path: "/"})
@@ -138,9 +146,9 @@ func (m *mockServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockServer) handleTracker(w http.ResponseWriter, r *http.Request) {
-	m.trackerHits++
+	hits := m.trackerHits.Add(1)
 
-	if m.firstTrackerRedirects && m.trackerHits == 1 {
+	if m.firstTrackerRedirects && hits == 1 {
 		http.Redirect(w, r, "/forum/login.php", http.StatusFound)
 
 		return
@@ -150,6 +158,12 @@ func (m *mockServer) handleTracker(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockServer) handleTopic(w http.ResponseWriter, _ *http.Request) {
+	if m.topicNoTitle {
+		writeCP1251(w, http.StatusOK, `<html><body>checking your browser…</body></html>`)
+
+		return
+	}
+
 	writeCP1251(w, http.StatusOK, topicHTML)
 }
 
@@ -213,6 +227,97 @@ func TestNew_InvalidBaseURL(t *testing.T) {
 	_, err := New(&Options{BaseURL: "not-a-url"})
 	if !errors.Is(err, ErrInvalidBaseURL) {
 		t.Fatalf("expected ErrInvalidBaseURL, got %v", err)
+	}
+}
+
+func TestNew_InsecureBaseURL(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(&Options{BaseURL: "http://rutracker.org/forum/"})
+	if !errors.Is(err, ErrInsecureBaseURL) {
+		t.Fatalf("expected ErrInsecureBaseURL for an http base, got %v", err)
+	}
+}
+
+func TestTopicInfo_NoTitleIsParseError(t *testing.T) {
+	t.Parallel()
+
+	mock := newMockServer(t)
+	mock.topicNoTitle = true
+	scraper := mock.newScraper(t, &Options{Cookie: testSession})
+
+	_, err := scraper.TopicInfo(t.Context(), testTopicID)
+	if !errors.Is(err, ErrParse) {
+		t.Fatalf("expected ErrParse for a titleless page, got %v", err)
+	}
+}
+
+func TestSortFieldCode(t *testing.T) {
+	t.Parallel()
+
+	cases := map[SortField]string{
+		SortDate:      "1",
+		SortDownloads: "4",
+		SortSize:      "7",
+		SortSeeders:   "10",
+		"":            "10",
+		"bogus":       "10",
+	}
+
+	for field, want := range cases {
+		if got := sortFieldCode(field); got != want {
+			t.Errorf("sortFieldCode(%q) = %q, want %q", field, got, want)
+		}
+	}
+}
+
+func TestSortOrderCode(t *testing.T) {
+	t.Parallel()
+
+	cases := map[SortOrder]string{
+		OrderAsc:  "1",
+		OrderDesc: "2",
+		"":        "2",
+		"bogus":   "2",
+	}
+
+	for order, want := range cases {
+		if got := sortOrderCode(order); got != want {
+			t.Errorf("sortOrderCode(%q) = %q, want %q", order, got, want)
+		}
+	}
+}
+
+func TestTopicIDFromHref(t *testing.T) {
+	t.Parallel()
+
+	if got := topicIDFromHref("viewtopic.php?t=12345"); got != 12345 {
+		t.Errorf("topicIDFromHref(valid) = %d, want 12345", got)
+	}
+
+	if got := topicIDFromHref("tracker.php?f=10"); got != 0 {
+		t.Errorf("topicIDFromHref(no t) = %d, want 0", got)
+	}
+
+	if got := topicIDFromHref("::not a url::"); got != 0 {
+		t.Errorf("topicIDFromHref(garbage) = %d, want 0", got)
+	}
+}
+
+func TestSearch_LimitExceedsResults(t *testing.T) {
+	t.Parallel()
+
+	mock := newMockServer(t)
+	scraper := mock.newScraper(t, &Options{Cookie: testSession})
+
+	// The mock serves 2 rows; a larger limit must return all of them, not error.
+	results, err := scraper.Search(t.Context(), "матрица", SearchOptions{Limit: 50})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
 	}
 }
 
@@ -322,8 +427,8 @@ func TestCookieOverride_SkipsLogin(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 
-	if mock.loginCount != 0 {
-		t.Errorf("expected no login with cookie override, got %d logins", mock.loginCount)
+	if mock.loginCount.Load() != 0 {
+		t.Errorf("expected no login with cookie override, got %d logins", mock.loginCount.Load())
 	}
 }
 
@@ -338,8 +443,8 @@ func TestLogin_Success(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 
-	if mock.loginCount != 1 {
-		t.Errorf("expected exactly 1 login, got %d", mock.loginCount)
+	if mock.loginCount.Load() != 1 {
+		t.Errorf("expected exactly 1 login, got %d", mock.loginCount.Load())
 	}
 }
 
@@ -399,8 +504,8 @@ func TestReauth_OnSessionExpiry(t *testing.T) {
 		t.Fatal("expected results after reauth")
 	}
 
-	if mock.loginCount != 2 {
-		t.Errorf("expected 2 logins (initial + reauth), got %d", mock.loginCount)
+	if mock.loginCount.Load() != 2 {
+		t.Errorf("expected 2 logins (initial + reauth), got %d", mock.loginCount.Load())
 	}
 }
 
@@ -435,6 +540,10 @@ func TestTopicInfo_ParsesMagnetSizeAndHash(t *testing.T) {
 		t.Errorf("seeders/leechers = %d/%d, want 123/7", info.Seeders, info.Leechers)
 	}
 
+	if info.Forum != testForum+" (UHD Video)" {
+		t.Errorf("Forum = %q, want the last breadcrumb link", info.Forum)
+	}
+
 	if !strings.Contains(info.Description, "отличное качество") {
 		t.Errorf("Description = %q, want decoded cyrillic text", info.Description)
 	}
@@ -451,8 +560,8 @@ func TestMagnet_ReturnsLink(t *testing.T) {
 		t.Fatalf("Magnet: %v", err)
 	}
 
-	if magnetInfoHash(magnet) != testInfoHash {
-		t.Errorf("magnet hash = %q, want %q", magnetInfoHash(magnet), testInfoHash)
+	if MagnetInfoHash(magnet) != testInfoHash {
+		t.Errorf("magnet hash = %q, want %q", MagnetInfoHash(magnet), testInfoHash)
 	}
 }
 
@@ -554,15 +663,17 @@ func TestFiles_EmptyTreeIsNotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound for an empty tree, got %v", err)
 	}
 
-	if mock.loginCount != 0 {
-		t.Errorf("empty tree must not trigger a re-login, got %d logins", mock.loginCount)
+	if mock.loginCount.Load() != 0 {
+		t.Errorf("empty tree must not trigger a re-login, got %d logins", mock.loginCount.Load())
 	}
 }
 
-func TestMirrorFailover_OnServerError(t *testing.T) {
-	t.Parallel()
+// twoMirrorScraper builds a scraper whose first mirror always answers 5xx (like
+// rutracker.org behind Cloudflare) and whose second mirror is a healthy mock.
+// It returns the scraper and the healthy mirror's host.
+func twoMirrorScraper(t *testing.T) (*Scraper, string) {
+	t.Helper()
 
-	// Primary mirror always answers 5xx (like rutracker.org behind Cloudflare).
 	bad := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
@@ -596,6 +707,14 @@ func TestMirrorFailover_OnServerError(t *testing.T) {
 	}
 	scraper.seedCookies()
 
+	return scraper, goodURL.Host
+}
+
+func TestMirrorFailover_OnServerError(t *testing.T) {
+	t.Parallel()
+
+	scraper, goodHost := twoMirrorScraper(t)
+
 	results, err := scraper.Search(t.Context(), "матрица", SearchOptions{})
 	if err != nil {
 		t.Fatalf("Search across mirrors: %v", err)
@@ -605,8 +724,99 @@ func TestMirrorFailover_OnServerError(t *testing.T) {
 		t.Fatal("expected results from the healthy mirror")
 	}
 
+	if scraper.currentBase().Host != goodHost {
+		t.Errorf("active mirror = %s, want %s", scraper.currentBase().Host, goodHost)
+	}
+}
+
+func TestMirrorFailover_StaleCookieReauthsOnNewMirror(t *testing.T) {
+	t.Parallel()
+
+	// Realistic production failure: rutracker.org answers 52x, we fail over to
+	// rutracker.net, but the pasted/persisted cookie is expired. A client with a
+	// username and password must recover by logging in on the new mirror rather
+	// than dead-ending on the stale seeded cookie.
+	bad := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(bad.Close)
+
+	good := newMockServer(t)
+	good.firstTrackerRedirects = true // the stale cookie is rejected once, then login works
+
+	badURL, _ := url.Parse(bad.URL + "/forum/")
+	goodURL, _ := url.Parse(good.server.URL + "/forum/")
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar: %v", err)
+	}
+
+	insecure := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+
+	scraper := &Scraper{
+		bases:     []*url.URL{badURL, goodURL},
+		http:      &http.Client{Jar: jar, Transport: insecure},
+		jar:       jar,
+		username:  testUsername,
+		password:  testPassword,
+		cookie:    "bb_session=stale-and-expired",
+		userAgent: defaultUserAgent,
+	}
+	scraper.seedCookies()
+
+	results, err := scraper.Search(t.Context(), "матрица", SearchOptions{})
+	if err != nil {
+		t.Fatalf("Search did not recover from a stale cookie after failover: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatal("expected results after re-login on the healthy mirror")
+	}
+
+	if good.loginCount.Load() != 1 {
+		t.Errorf("expected exactly 1 login on the new mirror, got %d", good.loginCount.Load())
+	}
+
 	if scraper.currentBase().Host != goodURL.Host {
 		t.Errorf("active mirror = %s, want %s", scraper.currentBase().Host, goodURL.Host)
+	}
+}
+
+func TestMirrorFailover_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	scraper, goodHost := twoMirrorScraper(t)
+
+	const workers = 24
+
+	var wg sync.WaitGroup
+
+	errs := make([]error, workers)
+	counts := make([]int, workers)
+
+	for i := range workers {
+		wg.Go(func() {
+			results, err := scraper.Search(t.Context(), "матрица", SearchOptions{})
+			errs[i] = err
+			counts[i] = len(results)
+		})
+	}
+
+	wg.Wait()
+
+	for i := range workers {
+		if errs[i] != nil {
+			t.Errorf("worker %d: %v", i, errs[i])
+		}
+
+		if counts[i] == 0 {
+			t.Errorf("worker %d: got no results", i)
+		}
+	}
+
+	if scraper.currentBase().Host != goodHost {
+		t.Errorf("active mirror = %s, want %s after concurrent failover", scraper.currentBase().Host, goodHost)
 	}
 }
 
@@ -631,7 +841,7 @@ func TestSessionPersistence_RoundTrip(t *testing.T) {
 		t.Fatalf("second Search (persisted session): %v", err)
 	}
 
-	if mock.loginCount != 1 {
-		t.Errorf("expected exactly 1 login across both scrapers, got %d", mock.loginCount)
+	if mock.loginCount.Load() != 1 {
+		t.Errorf("expected exactly 1 login across both scrapers, got %d", mock.loginCount.Load())
 	}
 }

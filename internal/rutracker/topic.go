@@ -46,7 +46,7 @@ func (s *Scraper) topicInfo(ctx context.Context, topicID int) (*TopicInfo, error
 	}
 
 	info.Magnet = extractMagnet(doc)
-	info.InfoHash = magnetInfoHash(info.Magnet)
+	info.InfoHash = MagnetInfoHash(info.Magnet)
 	info.SizeBytes = extractSize(doc, info.Magnet)
 
 	return info, nil
