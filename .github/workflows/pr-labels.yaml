@@ -1,0 +1,103 @@
+name: PR Labels
+
+# Auto-applies kind/*, area/*, and size/* labels to PRs from the Conventional
+# Commit title and the changed files. addLabels is additive, so it never removes
+# labels a human applied. Uses pull_request_target (no checkout of PR code) so
+# fork PRs get labelled with a write-scoped token.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    name: Apply derived labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const title = pr.title || '';
+
+            const labels = new Set();
+
+            // kind/* from the Conventional Commit type.
+            const match = title.match(/^(\w+)(\([^)]*\))?(!)?:/);
+            const type = match ? match[1] : '';
+            const breaking = match ? Boolean(match[3]) : false;
+            const kindByType = {
+              feat: 'kind/feature',
+              fix: 'kind/bug',
+              docs: 'kind/documentation',
+            };
+            if (breaking) {
+              labels.add('kind/breaking-change');
+            } else if (kindByType[type]) {
+              labels.add(kindByType[type]);
+            } else if (type) {
+              labels.add('kind/cleanup');
+            }
+
+            // area/* from the changed file paths.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const areaRules = [
+              [/^internal\/rutracker\//, 'area/rutracker'],
+              [/^internal\/torrentmeta\//, 'area/bencode'],
+              [/^internal\/tools\//, 'area/tools'],
+              [/^internal\/config\//, 'area/config'],
+              [/^cmd\//, 'area/cmd'],
+              [/^\.github\//, 'area/ci'],
+              [/^go\.(mod|sum)$/, 'area/dependencies'],
+              [/\.md$/, 'area/docs'],
+            ];
+
+            const areas = new Set();
+            for (const file of files) {
+              for (const [pattern, label] of areaRules) {
+                if (pattern.test(file.filename)) {
+                  areas.add(label);
+                }
+              }
+            }
+            if (areas.size === 0) {
+              areas.add('area/uncategorized');
+            }
+            for (const area of areas) {
+              labels.add(area);
+            }
+
+            // size/* from total changed lines.
+            const changed = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);
+            const sizeFor = (n) => {
+              if (n < 10) return 'size/XS';
+              if (n < 30) return 'size/S';
+              if (n < 100) return 'size/M';
+              if (n < 500) return 'size/L';
+              if (n < 1000) return 'size/XL';
+              return 'size/XXL';
+            };
+            labels.add(sizeFor(changed));
+
+            core.info(`PR #${pr.number}: "${title}" -> ${[...labels].join(', ')}`);
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: [...labels],
+            });
