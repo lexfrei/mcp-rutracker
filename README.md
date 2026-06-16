@@ -1,5 +1,7 @@
 # mcp-rutracker
 
+[![CI](https://github.com/lexfrei/mcp-rutracker/actions/workflows/ci.yml/badge.svg)](https://github.com/lexfrei/mcp-rutracker/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/lexfrei/mcp-rutracker?sort=semver)](https://github.com/lexfrei/mcp-rutracker/releases) [![Go Report Card](https://goreportcard.com/badge/github.com/lexfrei/mcp-rutracker)](https://goreportcard.com/report/github.com/lexfrei/mcp-rutracker) [![Go](https://img.shields.io/github/go-mod/go-version/lexfrei/mcp-rutracker)](go.mod) [![License](https://img.shields.io/github/license/lexfrei/mcp-rutracker)](LICENSE)
+
 MCP server for [RuTracker](https://rutracker.org). Search torrents, inspect topics, list the files inside a torrent without downloading it, resolve magnet links, and download `.torrent` files — all from any MCP-compatible client.
 
 ## Why another one?
@@ -96,6 +98,10 @@ RUTRACKER_LIVE=1 RUTRACKER_USERNAME=... RUTRACKER_PASSWORD=... \
   RUTRACKER_BASE_URL=https://rutracker.net/forum/ \
   go test -run TestLive -count=1 ./internal/rutracker/
 ```
+
+## Support
+
+If this project is useful to you, you can support its development via [GitHub Sponsors](https://github.com/sponsors/lexfrei).
 
 ## See also
 
