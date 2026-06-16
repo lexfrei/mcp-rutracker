@@ -27,3 +27,11 @@ var ErrParse = errors.New("failed to parse rutracker response")
 
 // ErrInvalidBaseURL indicates the configured base URL lacks a scheme or host.
 var ErrInvalidBaseURL = errors.New("invalid base URL: scheme and host are required")
+
+// ErrInsecureBaseURL indicates the configured base URL is not HTTPS; rutracker
+// is HTTPS-only and an http base would silently drop the secure session cookie.
+var ErrInsecureBaseURL = errors.New("base URL must use https")
+
+// ErrMirrorUnavailable indicates a transport error or 5xx response from the
+// current mirror, signalling the client to fail over to the next base URL.
+var ErrMirrorUnavailable = errors.New("rutracker mirror unavailable")

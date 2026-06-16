@@ -1,9 +1,12 @@
 package rutracker
 
 import (
+	"crypto/tls"
 	"errors"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,11 +51,11 @@ const searchHTML = `<html><body><table id="tor-tbl"><tbody>
 </tbody></table></body></html>`
 
 const topicHTML = `<html><body>
-<h1 class="maintitle"><a id="topic-title" href="viewtopic.php?t=6543210">Матрица / The Matrix (1999) BDRemux</a></h1>
-<a class="magnet-link" href="magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01&amp;dn=Matrix&amp;xl=32212254720">Скачать по magnet-ссылке</a>
-<span id="tor-size-humn" class="size-humn" data-ts_text="32212254720">30&nbsp;GB</span>
-<span class="seed"><b>123</b></span>
-<span class="leech"><b>7</b></span>
+<h1 class="maintitle"><a id="topic-title" class="topic-title-6543210" href="https://rutracker.org/forum/viewtopic.php?t=6543210">Матрица / The Matrix (1999) BDRemux</a></h1>
+<a href="magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01&amp;tr=http%3A%2F%2Fbt.t-ru.org%2Fann" class="med magnet-link">Скачать по magnet-ссылке</a>
+<span id="tor-size-humn" title="32212254720">30&nbsp;GB</span>
+<span class="seed">Сиды:&nbsp; <b>123</b></span>
+<span class="leech">Личи:&nbsp; <b>7</b></span>
 <div class="post_body">Описание раздачи: отличное качество видео и звука.</div>
 </body></html>`
 
@@ -62,6 +65,18 @@ const loginPageHTML = `<html><body><form id="login-form" action="login.php" meth
 const captchaPageHTML = `<html><body><form id="login-form" action="login.php" method="post">
 <img src="/captcha/12345.jpg"><input name="cap_sid" value="abc"><input name="cap_code_xyz">
 <input name="login_username"><input type="submit" name="login" value="Вход"></form></body></html>`
+
+// fileTreeHTML mimics the UTF-8 viewtorrent.php fragment: one folder with two
+// files plus a top-level file. Cyrillic here verifies the fragment is parsed as
+// UTF-8 (not windows-1251 like the rest of the site).
+const fileTreeHTML = `<ul class="ftree">` +
+	`<li class="dir"><div><b>Сезон 1</b><s></s></div>` +
+	`<ul>` +
+	`<li><div><b>e01.mkv</b><s></s><i>1500000000</i></div></li>` +
+	`<li><div><b>e02.mkv</b><s></s><i>1600000000</i></div></li>` +
+	`</ul></li>` +
+	`<li><div><b>readme.txt</b><s></s><i>1024</i></div></li>` +
+	`</ul>`
 
 // torrentBytes is a minimal but valid single-file bencoded .torrent.
 var torrentBytes = []byte("d4:infod6:lengthi1024e4:name8:file.txt12:piece lengthi16384eee")
@@ -81,6 +96,8 @@ type mockServer struct {
 	// downloadReturnsHTML makes dl.php return an HTML page instead of a torrent,
 	// simulating a stale session that yields a login page with status 200.
 	downloadReturnsHTML bool
+	// emptyFileTree makes viewtorrent.php return a present-but-empty ftree.
+	emptyFileTree bool
 }
 
 func newMockServer(t *testing.T) *mockServer {
@@ -92,6 +109,7 @@ func newMockServer(t *testing.T) *mockServer {
 	mux.HandleFunc("/forum/login.php", mock.handleLogin)
 	mux.HandleFunc("/forum/tracker.php", mock.handleTracker)
 	mux.HandleFunc("/forum/viewtopic.php", mock.handleTopic)
+	mux.HandleFunc("/forum/viewtorrent.php", mock.handleFileList)
 	mux.HandleFunc("/forum/dl.php", mock.handleDownload)
 
 	mock.server = httptest.NewTLSServer(mux)
@@ -133,6 +151,20 @@ func (m *mockServer) handleTracker(w http.ResponseWriter, r *http.Request) {
 
 func (m *mockServer) handleTopic(w http.ResponseWriter, _ *http.Request) {
 	writeCP1251(w, http.StatusOK, topicHTML)
+}
+
+// handleFileList serves the file tree as UTF-8, matching the real endpoint.
+func (m *mockServer) handleFileList(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	if m.emptyFileTree {
+		_, _ = w.Write([]byte(`<ul class="ftree"></ul>`))
+
+		return
+	}
+
+	_, _ = w.Write([]byte(fileTreeHTML))
 }
 
 func (m *mockServer) handleDownload(w http.ResponseWriter, _ *http.Request) {
@@ -181,6 +213,31 @@ func TestNew_InvalidBaseURL(t *testing.T) {
 	_, err := New(&Options{BaseURL: "not-a-url"})
 	if !errors.Is(err, ErrInvalidBaseURL) {
 		t.Fatalf("expected ErrInvalidBaseURL, got %v", err)
+	}
+}
+
+func TestEncodeWindows1251_RepresentableAndNot(t *testing.T) {
+	t.Parallel()
+
+	// Cyrillic and Latin encode cleanly...
+	encoded, err := encodeWindows1251("Матрица")
+	if err != nil {
+		t.Fatalf("Cyrillic must encode without error, got %v", err)
+	}
+
+	if len(encoded) != 7 {
+		t.Errorf("encoded length = %d, want 7 (one byte per Cyrillic letter)", len(encoded))
+	}
+
+	// ...while runes outside windows-1251 are rejected, not silently mangled
+	// into substitution bytes — so a search query is never corrupted. The CJK
+	// sample is built from runes to avoid a non-Latin source literal.
+	cjk := string([]rune{0x65E5, 0x672C, 0x8A9E})
+	for _, unmappable := range []string{cjk, "🎬"} {
+		_, err := encodeWindows1251(unmappable)
+		if err == nil {
+			t.Errorf("expected an error encoding %q, got nil", unmappable)
+		}
 	}
 }
 
@@ -436,31 +493,120 @@ func TestDownloadTorrent_NonBencodeIsAuthError(t *testing.T) {
 	}
 }
 
-func TestTorrentFiles_ParsesFileList(t *testing.T) {
+func TestFiles_ParsesTreeFromTopicPage(t *testing.T) {
 	t.Parallel()
 
 	mock := newMockServer(t)
 	scraper := mock.newScraper(t, &Options{Cookie: testSession})
 
-	meta, err := scraper.TorrentFiles(t.Context(), testTopicID)
+	list, err := scraper.Files(t.Context(), testTopicID)
 	if err != nil {
-		t.Fatalf("TorrentFiles: %v", err)
+		t.Fatalf("Files: %v", err)
 	}
 
-	if meta.Name != "file.txt" {
-		t.Errorf("Name = %q, want file.txt", meta.Name)
+	if list.FileCount != 3 {
+		t.Fatalf("FileCount = %d, want 3", list.FileCount)
 	}
 
-	if meta.FileCount != 1 || meta.Files[0].SizeBytes != 1024 {
-		t.Errorf("files = %+v, want one 1024-byte file", meta.Files)
+	want := []FileEntry{
+		{Path: "Сезон 1/e01.mkv", SizeBytes: 1500000000},
+		{Path: "Сезон 1/e02.mkv", SizeBytes: 1600000000},
+		{Path: "readme.txt", SizeBytes: 1024},
 	}
 
-	if meta.TotalSizeBytes != 1024 {
-		t.Errorf("TotalSizeBytes = %d, want 1024", meta.TotalSizeBytes)
+	for i, entry := range want {
+		if list.Files[i] != entry {
+			t.Errorf("file[%d] = %+v, want %+v", i, list.Files[i], entry)
+		}
 	}
 
-	if len(meta.InfoHash) != 40 {
-		t.Errorf("InfoHash = %q, want 40 hex chars", meta.InfoHash)
+	if list.TotalSizeBytes != 3100001024 {
+		t.Errorf("TotalSizeBytes = %d, want 3100001024", list.TotalSizeBytes)
+	}
+}
+
+func TestDownloadTorrent_TooLargeIsRejected(t *testing.T) {
+	t.Parallel()
+
+	mock := newMockServer(t)
+	scraper := mock.newScraper(t, &Options{Cookie: testSession})
+	// The mock serves a 62-byte torrent; cap below that to force the over-size
+	// path, proving the body is rejected rather than silently truncated.
+	scraper.maxTorrentBytes = 10
+
+	_, err := scraper.DownloadTorrent(t.Context(), testTopicID)
+	if !errors.Is(err, ErrTorrentTooLarge) {
+		t.Fatalf("expected ErrTorrentTooLarge, got %v", err)
+	}
+}
+
+func TestFiles_EmptyTreeIsNotFound(t *testing.T) {
+	t.Parallel()
+
+	mock := newMockServer(t)
+	mock.emptyFileTree = true
+	// Cookie-only client: a re-login is impossible, so a present-but-empty tree
+	// must surface as ErrNotFound rather than a misleading auth error.
+	scraper := mock.newScraper(t, &Options{Cookie: testSession})
+
+	_, err := scraper.Files(t.Context(), testTopicID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for an empty tree, got %v", err)
+	}
+
+	if mock.loginCount != 0 {
+		t.Errorf("empty tree must not trigger a re-login, got %d logins", mock.loginCount)
+	}
+}
+
+func TestMirrorFailover_OnServerError(t *testing.T) {
+	t.Parallel()
+
+	// Primary mirror always answers 5xx (like rutracker.org behind Cloudflare).
+	bad := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(bad.Close)
+
+	good := newMockServer(t)
+
+	badURL, err := url.Parse(bad.URL + "/forum/")
+	if err != nil {
+		t.Fatalf("parse bad URL: %v", err)
+	}
+
+	goodURL, err := url.Parse(good.server.URL + "/forum/")
+	if err != nil {
+		t.Fatalf("parse good URL: %v", err)
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar: %v", err)
+	}
+
+	insecure := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+
+	scraper := &Scraper{
+		bases:     []*url.URL{badURL, goodURL},
+		http:      &http.Client{Jar: jar, Transport: insecure},
+		jar:       jar,
+		cookie:    testSession,
+		userAgent: defaultUserAgent,
+	}
+	scraper.seedCookies()
+
+	results, err := scraper.Search(t.Context(), "матрица", SearchOptions{})
+	if err != nil {
+		t.Fatalf("Search across mirrors: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatal("expected results from the healthy mirror")
+	}
+
+	if scraper.currentBase().Host != goodURL.Host {
+		t.Errorf("active mirror = %s, want %s", scraper.currentBase().Host, goodURL.Host)
 	}
 }
 

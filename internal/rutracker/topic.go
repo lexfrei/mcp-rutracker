@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/cockroachdb/errors"
 )
 
 // topicPath is the rutracker topic-view endpoint, relative to the forum base.
@@ -27,7 +28,10 @@ func (s *Scraper) topicInfo(ctx context.Context, topicID int) (*TopicInfo, error
 
 	title := cleanText(doc.Find("a#topic-title, h1.maintitle").First().Text())
 	if title == "" {
-		return nil, ErrNotFound
+		// A 200 response without a topic title is not necessarily a deleted
+		// topic: it is also what an anti-bot interstitial returns. Report a
+		// parse failure rather than a misleading "not found".
+		return nil, errors.Wrap(ErrParse, "topic page has no title")
 	}
 
 	info := &TopicInfo{
@@ -64,17 +68,20 @@ func extractMagnet(doc *goquery.Document) string {
 	return ""
 }
 
-// extractSize resolves the torrent size in bytes, preferring the exact value
-// carried by the magnet's xl parameter and falling back to the size span.
+// extractSize resolves the torrent size in bytes. rutracker exposes the exact
+// byte count in the title attribute of the size span (and sometimes via the
+// magnet's xl parameter), so both are preferred over the human-readable text.
 func extractSize(doc *goquery.Document, magnet string) int64 {
 	if size := magnetExactLength(magnet); size > 0 {
 		return size
 	}
 
-	span := doc.Find("span.size-humn, #tor-size-humn").First()
+	span := doc.Find("#tor-size-humn, span.size-humn").First()
 
-	if bytes := atoi64Safe(span.AttrOr("data-ts_text", "")); bytes > 0 {
-		return bytes
+	for _, attr := range []string{"title", "data-ts_text"} {
+		if bytes := atoi64Safe(span.AttrOr(attr, "")); bytes > 0 {
+			return bytes
+		}
 	}
 
 	return 0

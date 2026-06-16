@@ -83,7 +83,7 @@ func encodeValues(values url.Values) (string, error) {
 func (s *Scraper) resolve(path, rawQuery string) string {
 	ref := &url.URL{Path: path, RawQuery: rawQuery}
 
-	return s.base.ResolveReference(ref).String()
+	return s.currentBase().ResolveReference(ref).String()
 }
 
 // newRequest creates a request with the configured User-Agent applied.
@@ -116,9 +116,9 @@ func (s *Scraper) getDoc(ctx context.Context, path string, query url.Values) (*g
 		return nil, err
 	}
 
-	resp, err := s.http.Do(req)
+	resp, err := s.doRequest(req)
 	if err != nil {
-		return nil, errors.Wrap(err, "GET "+path)
+		return nil, err
 	}
 
 	defer func() { _ = resp.Body.Close() }()
@@ -135,6 +135,25 @@ func (s *Scraper) getDoc(ctx context.Context, path string, query url.Values) (*g
 	return doc, nil
 }
 
+// doRequest performs a request, classifying transport failures and 5xx
+// responses as ErrMirrorUnavailable so the caller can fail over to another
+// mirror. The caller owns the returned body.
+func (s *Scraper) doRequest(req *http.Request) (*http.Response, error) {
+	resp, err := s.http.Do(req)
+	if err != nil {
+		//nolint:wrapcheck // Mark adds the mirror-failover sentinel on top of Wrap.
+		return nil, errors.Mark(errors.Wrap(err, req.Method+" "+req.URL.Path), ErrMirrorUnavailable)
+	}
+
+	if resp.StatusCode >= http.StatusInternalServerError {
+		_ = resp.Body.Close()
+
+		return nil, errors.Wrapf(ErrMirrorUnavailable, "status %d from %s", resp.StatusCode, req.URL.Host)
+	}
+
+	return resp, nil
+}
+
 // getRaw fetches a binary resource (e.g. a .torrent file). The caller owns the
 // returned response body and must close it. It returns ErrNotAuthenticated when
 // the request was redirected to the login page.
@@ -149,11 +168,18 @@ func (s *Scraper) getRaw(ctx context.Context, path string, query url.Values) (*h
 		return nil, err
 	}
 
-	req.Header.Set("Referer", s.resolve("/forum/viewtopic.php", ""))
+	// Reference the specific topic page, matching what a browser sends from the
+	// download button and keeping parity with the file-list request's Referer.
+	refererQuery := ""
+	if topic := query.Get("t"); topic != "" {
+		refererQuery = "t=" + topic
+	}
 
-	resp, err := s.http.Do(req)
+	req.Header.Set("Referer", s.resolve("/forum/viewtopic.php", refererQuery))
+
+	resp, err := s.doRequest(req)
 	if err != nil {
-		return nil, errors.Wrap(err, "GET "+path)
+		return nil, err
 	}
 
 	if isLoginRedirect(resp) {

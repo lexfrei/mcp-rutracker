@@ -35,9 +35,14 @@ type persistedCookie struct {
 
 // seedCookies populates the jar from the raw cookie override and, failing that,
 // the persisted session file. It never logs in; that is deferred to ensureAuth.
+// The override and persisted cookies are applied to every mirror so they remain
+// valid after a failover.
 func (s *Scraper) seedCookies() {
 	if s.cookie != "" {
-		s.jar.SetCookies(s.base, parseCookieHeader(s.cookie))
+		cookies := parseCookieHeader(s.cookie)
+		for _, base := range s.bases {
+			s.jar.SetCookies(base, cookies)
+		}
 
 		return
 	}
@@ -100,9 +105,9 @@ func (s *Scraper) login(ctx context.Context) error {
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := s.http.Do(req)
+	resp, err := s.doRequest(req)
 	if err != nil {
-		return errors.Wrap(err, "POST login.php")
+		return err
 	}
 
 	defer func() { _ = resp.Body.Close() }()
@@ -189,16 +194,18 @@ func (s *Scraper) loadCookies() {
 		cookies = append(cookies, sessionCookie(item.Name, item.Value))
 	}
 
-	s.jar.SetCookies(s.base, cookies)
+	for _, base := range s.bases {
+		s.jar.SetCookies(base, cookies)
+	}
 }
 
-// saveCookies persists the current jar cookies for the base domain.
+// saveCookies persists the active mirror's jar cookies.
 func (s *Scraper) saveCookies() {
 	if s.cookiePath == "" {
 		return
 	}
 
-	jarCookies := s.jar.Cookies(s.base)
+	jarCookies := s.jar.Cookies(s.currentBase())
 	stored := make([]persistedCookie, 0, len(jarCookies))
 
 	for _, cookie := range jarCookies {

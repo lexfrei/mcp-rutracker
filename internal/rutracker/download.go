@@ -24,6 +24,10 @@ const bencodeDictPrefix = 'd'
 // ErrDownloadFailed indicates dl.php returned something other than a .torrent.
 var ErrDownloadFailed = errors.New("download did not return a .torrent file")
 
+// ErrTorrentTooLarge indicates the .torrent body exceeded the size cap; the
+// download is rejected rather than silently truncated to a wrong info-hash.
+var ErrTorrentTooLarge = errors.New("torrent file exceeds the maximum allowed size")
+
 // DownloadTorrent fetches the .torrent file for a topic, re-authenticating once
 // if the session expired.
 func (s *Scraper) DownloadTorrent(ctx context.Context, topicID int) (*TorrentFile, error) {
@@ -44,9 +48,15 @@ func (s *Scraper) downloadTorrent(ctx context.Context, topicID int) (*TorrentFil
 		return nil, errors.Wrapf(ErrDownloadFailed, "status %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxTorrentSize))
+	// Read one byte past the cap so an over-sized body is detected and rejected
+	// rather than silently truncated into a wrong info-hash.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, s.maxTorrentBytes+1))
 	if err != nil {
 		return nil, errors.Wrap(err, "read torrent body")
+	}
+
+	if int64(len(data)) > s.maxTorrentBytes {
+		return nil, errors.Wrapf(ErrTorrentTooLarge, "exceeds %d bytes", s.maxTorrentBytes)
 	}
 
 	// rutracker serves an HTML page (login or error) instead of a redirect when
@@ -79,7 +89,9 @@ func (s *Scraper) Magnet(ctx context.Context, topicID int) (string, error) {
 }
 
 // filenameFromResponse derives a download filename from the Content-Disposition
-// header, falling back to "<topicID>.torrent".
+// header, falling back to "<topicID>.torrent". The returned name is
+// server-controlled and untrusted: callers writing it to disk must sanitise it
+// (saveTorrent uses filepath.Base).
 func filenameFromResponse(resp *http.Response, topicID int) string {
 	fallback := strconv.Itoa(topicID) + ".torrent"
 
