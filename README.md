@@ -10,6 +10,7 @@ There are already several RuTracker MCP servers. This one exists because I wante
 
 ## Highlights
 
+- **Agent-friendly downloads** — `rutracker_download` returns a one-time, expiring download URL (or compact metadata) instead of dumping a giant base64 blob into the model's context. The `.torrent` is held in memory and served once over an internal URL.
 - File listing **without downloading the `.torrent`** — the cheap `viewtorrent.php` endpoint, with exact per-file sizes.
 - Mirror round-robin over `rutracker.org` / `rutracker.net` with automatic failover on network and `5xx` errors.
 - Canonical info-hash computed from the torrent's own bencode (and parsed from magnet links).
@@ -22,7 +23,7 @@ There are already several RuTracker MCP servers. This one exists because I wante
 - **rutracker_topic_info** — detailed topic view: title, exact size, seeders/leechers, info-hash, magnet link, and description.
 - **rutracker_files** — list the files inside a torrent with exact per-file sizes, read from the topic page **without downloading the `.torrent`**.
 - **rutracker_magnet** — resolve the magnet link and info-hash for a topic.
-- **rutracker_download** — download the `.torrent` as base64 (ready to hand to a BitTorrent client), enriched with the contained file list and info-hash decoded from the bytes; optionally saved to disk.
+- **rutracker_download** — fetch a topic's `.torrent`, enriched with its file list, info-hash, and sha256. Pick how it is delivered with `mode`: `metadata` (info only), `base64` (inline content for piping to a torrent client), or `artifact` (a one-time, expiring download URL). The default is `artifact` when the HTTP transport is enabled, otherwise `metadata` — never a giant base64 blob unless you ask for it.
 - **rutracker_server_version** — report the server version, revision, and Go runtime.
 
 ## Mirrors and resilience
@@ -44,8 +45,9 @@ Configuration is read from environment variables. Either username/password or a 
 | `RUTRACKER_BASE_URL` | Pin a single mirror (e.g. `https://rutracker.net/forum/`) | round-robin org/net |
 | `RUTRACKER_USER_AGENT` | Override the browser User-Agent | recent Chrome |
 | `RUTRACKER_PROXY` | HTTP/SOCKS5 proxy URL | — |
-| `RUTRACKER_DOWNLOAD_DIR` | Directory for `saveToDisk` downloads | — |
-| `MCP_HTTP_PORT` | Enable the HTTP transport on this port | stdio only |
+| `RUTRACKER_ARTIFACT_BASE_URL` | Externally reachable base for artifact download URLs (e.g. `http://mcp-rutracker.internal:9090`) | derived from the HTTP address |
+| `RUTRACKER_ARTIFACT_TTL` | How long an artifact download URL stays valid (Go duration) | `15m` |
+| `MCP_HTTP_PORT` | Enable the HTTP transport on this port (required for artifact downloads) | stdio only |
 | `MCP_HTTP_HOST` | HTTP bind host | `127.0.0.1` |
 
 ### Captcha
@@ -81,7 +83,17 @@ With Claude Code, via the bundled `.mcp.json` (Docker):
 
 The bundled `.mcp.json` ships with empty `RUTRACKER_USERNAME`/`RUTRACKER_PASSWORD` values — fill them in (or pass a `RUTRACKER_COOKIE`) before use. The server exits with an error at startup when no credentials are configured. The named volume persists the session cookie across `--rm` container runs; drop it if you do not want persistence.
 
-The base64 returned by `rutracker_download` is directly compatible with the `metainfo` parameter of a sibling Transmission MCP server, so a search result can be downloaded and added to a torrent client in one chain.
+## Downloads
+
+`rutracker_download` avoids putting large `.torrent` payloads into the model's context. Choose delivery with the `mode` parameter:
+
+- `metadata` — filename, size, and sha256, plus the info-hash and file list when the `.torrent` parses (no content).
+- `base64` — the above plus the inline base64 content, directly compatible with the `metainfo` parameter of a sibling Transmission MCP server.
+- `artifact` — the above plus a one-time `downloadUrl` and `expiresAt`. The `.torrent` is held in memory and served once from `GET /artifacts/{id}` on the HTTP transport, so a torrent client (or a human) can fetch it by URL. The response carries an `X-Content-Sha256` header equal to the tool's `sha256`, so a fetcher can detect a corrupted or truncated transfer — it attests the bytes the server holds, not the upstream torrent's correctness. Requires `MCP_HTTP_PORT`. See the reachability note below.
+
+The default is `artifact` when the HTTP transport is enabled, otherwise `metadata`. The download URL is an unguessable bearer capability, consumed on the first fetch attempt (a failed transfer burns it too — request a fresh download) and valid until it expires (`RUTRACKER_ARTIFACT_TTL`) — serve it only on a trusted network. The in-memory store is bounded: under an extreme burst of unfetched downloads, `artifact` mode returns an error rather than silently evicting a still-valid URL, so retry once earlier downloads are fetched or expire.
+
+By default the URL is derived from the HTTP bind address, which is `http://127.0.0.1:<port>` — reachable only from the same host. To let another host fetch it, bind a routable interface (`MCP_HTTP_HOST`) and set `RUTRACKER_ARTIFACT_BASE_URL` to the externally reachable base (e.g. `http://mcp-rutracker.internal:9090`).
 
 ## Development
 
