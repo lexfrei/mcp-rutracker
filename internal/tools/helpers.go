@@ -44,14 +44,3 @@ func readOnly(title string) *mcp.ToolAnnotations {
 		OpenWorldHint: ptrBool(true),
 	}
 }
-
-// deref returns the pointed-to value, or the zero value when ptr is nil.
-func deref[T any](ptr *T) T {
-	if ptr != nil {
-		return *ptr
-	}
-
-	var zero T
-
-	return zero
-}

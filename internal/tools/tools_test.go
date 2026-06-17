@@ -1,14 +1,18 @@
 package tools_test
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
-	"path/filepath"
+	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/lexfrei/mcp-rutracker/internal/artifact"
 	"github.com/lexfrei/mcp-rutracker/internal/rutracker"
 	"github.com/lexfrei/mcp-rutracker/internal/tools"
 )
@@ -194,53 +198,146 @@ func TestMagnetHandler_Success(t *testing.T) {
 	}
 }
 
-func TestDownloadHandler_SuccessEnriched(t *testing.T) {
-	t.Parallel()
-
-	client := &mockClient{torrentFile: &rutracker.TorrentFile{
+func downloadClient() *mockClient {
+	return &mockClient{torrentFile: &rutracker.TorrentFile{
 		Filename:  torrentName,
 		Content:   validTorrent,
 		SizeBytes: len(validTorrent),
 	}}
-	handler := tools.NewDownloadHandler(client, "")
+}
+
+func TestDownloadHandler_DefaultMetadataInStdio(t *testing.T) {
+	t.Parallel()
+
+	// HTTP disabled -> default mode is metadata: enriched info, no content/URL.
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
 
 	_, result, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1})
 	if err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	decoded, decErr := base64.StdEncoding.DecodeString(result.ContentBase64)
-	if decErr != nil || string(decoded) != string(validTorrent) {
-		t.Errorf("base64 round-trip failed")
+	sum := sha256.Sum256(validTorrent)
+	if result.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Errorf("SHA256 = %q", result.SHA256)
 	}
 
-	if result.FileCount != 1 || result.TotalSizeBytes != 1024 {
+	if result.FileCount != 1 || result.TotalSizeBytes != 1024 || len(result.InfoHash) != 40 {
 		t.Errorf("enrichment failed: %+v", result)
 	}
 
-	if len(result.InfoHash) != 40 {
-		t.Errorf("InfoHash = %q, want 40 hex chars", result.InfoHash)
-	}
-
-	if result.SavedPath != "" {
-		t.Errorf("SavedPath = %q, want empty without saveToDisk", result.SavedPath)
+	if result.ContentBase64 != "" || result.DownloadURL != "" {
+		t.Errorf("metadata mode must not carry content/URL: %+v", result)
 	}
 }
 
-func TestDownloadHandler_UnparseableBodyStillReturnsBase64(t *testing.T) {
+func TestDownloadHandler_DefaultArtifactInHTTP(t *testing.T) {
 	t.Parallel()
 
-	// A body that is not a valid torrent must still download: the base64 is
-	// returned and the enrichment fields stay empty rather than failing.
-	content := []byte("not a valid bencoded torrent")
-	client := &mockClient{torrentFile: &rutracker.TorrentFile{
-		Filename:  torrentName,
-		Content:   content,
-		SizeBytes: len(content),
-	}}
-	handler := tools.NewDownloadHandler(client, "")
+	store := artifact.NewStore(time.Minute)
+	handler := tools.NewDownloadHandler(downloadClient(), store, "http://srv:9090", true)
 
 	_, result, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+
+	if result.ArtifactID == "" || result.ExpiresAt.IsZero() {
+		t.Errorf("artifact fields missing: %+v", result)
+	}
+
+	if result.DownloadURL != "http://srv:9090/artifacts/"+result.ArtifactID {
+		t.Errorf("DownloadURL = %q", result.DownloadURL)
+	}
+
+	if result.ContentBase64 != "" {
+		t.Error("artifact mode must not include base64")
+	}
+
+	// The token must resolve from the store exactly once.
+	if _, ok := store.Take(result.ArtifactID); !ok {
+		t.Error("stored artifact not retrievable")
+	}
+}
+
+func TestDownloadHandler_Base64Mode(t *testing.T) {
+	t.Parallel()
+
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "http://srv", true)
+
+	_, result, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1, Mode: "base64"})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+
+	decoded, decErr := base64.StdEncoding.DecodeString(result.ContentBase64)
+	if decErr != nil || string(decoded) != string(validTorrent) {
+		t.Error("base64 round-trip failed")
+	}
+
+	if result.DownloadURL != "" {
+		t.Error("base64 mode must not produce a download URL")
+	}
+}
+
+func TestDownloadHandler_ArtifactWithoutHTTP(t *testing.T) {
+	t.Parallel()
+
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
+
+	result, _, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1, Mode: "artifact"})
+	if !errors.Is(err, tools.ErrArtifactUnavailable) || !isError(result) {
+		t.Fatalf("expected ErrArtifactUnavailable, got %v", err)
+	}
+}
+
+func TestDownloadResult_ExpiresAtOmitzero(t *testing.T) {
+	t.Parallel()
+
+	store := artifact.NewStore(time.Minute)
+
+	artifactHandler := tools.NewDownloadHandler(downloadClient(), store, "http://srv", true)
+	_, artResult, err := artifactHandler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1})
+	if err != nil {
+		t.Fatalf("artifact handler: %v", err)
+	}
+
+	artJSON, _ := json.Marshal(artResult)
+	if !strings.Contains(string(artJSON), `"expiresAt"`) {
+		t.Errorf("artifact result must serialize expiresAt: %s", artJSON)
+	}
+
+	metaHandler := tools.NewDownloadHandler(downloadClient(), store, "", false)
+	_, metaResult, err := metaHandler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1})
+	if err != nil {
+		t.Fatalf("metadata handler: %v", err)
+	}
+
+	metaJSON, _ := json.Marshal(metaResult)
+	if strings.Contains(string(metaJSON), `"expiresAt"`) {
+		t.Errorf("metadata result must omit expiresAt (omitzero): %s", metaJSON)
+	}
+}
+
+func TestDownloadHandler_InvalidMode(t *testing.T) {
+	t.Parallel()
+
+	handler := tools.NewDownloadHandler(downloadClient(), artifact.NewStore(time.Minute), "", false)
+
+	_, _, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1, Mode: "bogus"})
+	if !errors.Is(err, tools.ErrInvalidMode) || !errors.Is(err, tools.ErrValidation) {
+		t.Fatalf("expected ErrInvalidMode + ErrValidation, got %v", err)
+	}
+}
+
+func TestDownloadHandler_UnparseableBodyEnrichmentEmpty(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("not a valid bencoded torrent")
+	client := &mockClient{torrentFile: &rutracker.TorrentFile{Filename: torrentName, Content: content, SizeBytes: len(content)}}
+	handler := tools.NewDownloadHandler(client, artifact.NewStore(time.Minute), "http://srv", true)
+
+	_, result, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1, Mode: "base64"})
 	if err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
@@ -251,73 +348,6 @@ func TestDownloadHandler_UnparseableBodyStillReturnsBase64(t *testing.T) {
 
 	if result.InfoHash != "" || result.FileCount != 0 {
 		t.Errorf("expected empty enrichment, got hash=%q count=%d", result.InfoHash, result.FileCount)
-	}
-}
-
-func TestDownloadHandler_SaveToDisk(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	client := &mockClient{torrentFile: &rutracker.TorrentFile{
-		Filename:  torrentName,
-		Content:   validTorrent,
-		SizeBytes: len(validTorrent),
-	}}
-	handler := tools.NewDownloadHandler(client, dir)
-
-	save := true
-	_, result, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{
-		TopicID:    1,
-		SaveToDisk: &save,
-	})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-
-	if result.SavedPath != filepath.Join(dir, torrentName) {
-		t.Errorf("SavedPath = %q", result.SavedPath)
-	}
-}
-
-func TestDownloadHandler_SaveSanitizesFilename(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	// A server-controlled filename with traversal must be reduced to its base
-	// name and stay inside the download directory.
-	client := &mockClient{torrentFile: &rutracker.TorrentFile{
-		Filename:  "../../../etc/evil.torrent",
-		Content:   validTorrent,
-		SizeBytes: len(validTorrent),
-	}}
-	handler := tools.NewDownloadHandler(client, dir)
-
-	save := true
-	_, result, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1, SaveToDisk: &save})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-
-	want := filepath.Join(dir, "evil.torrent")
-	if result.SavedPath != want {
-		t.Errorf("SavedPath = %q, want %q (traversal not contained)", result.SavedPath, want)
-	}
-
-	if filepath.Dir(result.SavedPath) != dir {
-		t.Errorf("saved outside the download dir: %q", result.SavedPath)
-	}
-}
-
-func TestDownloadHandler_SaveNoDir(t *testing.T) {
-	t.Parallel()
-
-	client := &mockClient{torrentFile: &rutracker.TorrentFile{Filename: torrentName, Content: validTorrent}}
-	handler := tools.NewDownloadHandler(client, "")
-
-	save := true
-	result, _, err := handler(t.Context(), &mcp.CallToolRequest{}, tools.DownloadParams{TopicID: 1, SaveToDisk: &save})
-	if !errors.Is(err, tools.ErrNoDownloadDir) || !isError(result) {
-		t.Fatalf("expected ErrNoDownloadDir, got %v", err)
 	}
 }
 

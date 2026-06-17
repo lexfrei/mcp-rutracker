@@ -90,8 +90,9 @@ func (s *Scraper) Magnet(ctx context.Context, topicID int) (string, error) {
 
 // filenameFromResponse derives a download filename from the Content-Disposition
 // header, falling back to "<topicID>.torrent". The returned name is
-// server-controlled and untrusted: callers writing it to disk must sanitise it
-// (saveTorrent uses filepath.Base).
+// server-controlled and untrusted: callers must sanitise it before using it in
+// a filesystem path or an HTTP header (the artifact handler reduces it to a
+// safe charset).
 func filenameFromResponse(resp *http.Response, topicID int) string {
 	fallback := strconv.Itoa(topicID) + ".torrent"
 

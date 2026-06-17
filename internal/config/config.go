@@ -9,17 +9,26 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
 
 const maxPort = 65535
 
+// defaultArtifactTTL bounds how long an artifact download URL stays valid.
+const defaultArtifactTTL = 15 * time.Minute
+
 // ErrInvalidHTTPPort is returned when MCP_HTTP_PORT is not a valid port number.
 var ErrInvalidHTTPPort = errors.New("MCP_HTTP_PORT must be a valid port number (1-65535)")
 
 // ErrInvalidProxy is returned when RUTRACKER_PROXY is not a valid URL.
 var ErrInvalidProxy = errors.New("RUTRACKER_PROXY must be a valid proxy URL")
+
+// ErrInvalidArtifactTTL is returned when RUTRACKER_ARTIFACT_TTL is not a valid
+// positive Go duration.
+var ErrInvalidArtifactTTL = errors.New("RUTRACKER_ARTIFACT_TTL must be a positive Go duration (e.g. 15m)")
 
 // Config holds the application configuration loaded from environment variables.
 type Config struct {
@@ -36,8 +45,12 @@ type Config struct {
 	UserAgent string
 	// Proxy is an optional HTTP/SOCKS5 proxy URL.
 	Proxy string
-	// DownloadDir is where .torrent files are written when requested.
-	DownloadDir string
+	// ArtifactBaseURL is the externally reachable base for artifact download
+	// URLs (e.g. http://mcp-rutracker.internal:9090). Empty derives it from the
+	// HTTP transport address.
+	ArtifactBaseURL string
+	// ArtifactTTL bounds how long an artifact download URL stays valid.
+	ArtifactTTL time.Duration
 	// HTTPPort and HTTPHost configure the optional HTTP transport.
 	HTTPPort string
 	HTTPHost string
@@ -61,23 +74,44 @@ func Load() (*Config, error) {
 		}
 	}
 
+	artifactTTL, ttlErr := parseArtifactTTL(os.Getenv("RUTRACKER_ARTIFACT_TTL"))
+	if ttlErr != nil {
+		return nil, ttlErr
+	}
+
 	httpHost := os.Getenv("MCP_HTTP_HOST")
 	if httpHost == "" {
 		httpHost = "127.0.0.1"
 	}
 
 	return &Config{
-		Username:    os.Getenv("RUTRACKER_USERNAME"),
-		Password:    os.Getenv("RUTRACKER_PASSWORD"),
-		Cookie:      os.Getenv("RUTRACKER_COOKIE"),
-		CookieFile:  resolveCookieFile(os.Getenv("RUTRACKER_COOKIE_FILE")),
-		BaseURL:     os.Getenv("RUTRACKER_BASE_URL"),
-		UserAgent:   os.Getenv("RUTRACKER_USER_AGENT"),
-		Proxy:       proxy,
-		DownloadDir: os.Getenv("RUTRACKER_DOWNLOAD_DIR"),
-		HTTPPort:    httpPort,
-		HTTPHost:    httpHost,
+		Username:        os.Getenv("RUTRACKER_USERNAME"),
+		Password:        os.Getenv("RUTRACKER_PASSWORD"),
+		Cookie:          os.Getenv("RUTRACKER_COOKIE"),
+		CookieFile:      resolveCookieFile(os.Getenv("RUTRACKER_COOKIE_FILE")),
+		BaseURL:         os.Getenv("RUTRACKER_BASE_URL"),
+		UserAgent:       os.Getenv("RUTRACKER_USER_AGENT"),
+		Proxy:           proxy,
+		ArtifactBaseURL: os.Getenv("RUTRACKER_ARTIFACT_BASE_URL"),
+		ArtifactTTL:     artifactTTL,
+		HTTPPort:        httpPort,
+		HTTPHost:        httpHost,
 	}, nil
+}
+
+// parseArtifactTTL parses RUTRACKER_ARTIFACT_TTL, defaulting to
+// defaultArtifactTTL when unset and rejecting non-positive durations.
+func parseArtifactTTL(raw string) (time.Duration, error) {
+	if raw == "" {
+		return defaultArtifactTTL, nil
+	}
+
+	ttl, err := time.ParseDuration(raw)
+	if err != nil || ttl <= 0 {
+		return 0, errors.Wrap(ErrInvalidArtifactTTL, raw)
+	}
+
+	return ttl, nil
 }
 
 // resolveCookieFile returns the configured cookie file, defaulting to
@@ -138,6 +172,29 @@ func parseProxy(raw string) (*url.URL, error) {
 // HTTPEnabled reports whether the HTTP transport should be started.
 func (c *Config) HTTPEnabled() bool {
 	return c.HTTPPort != ""
+}
+
+// ArtifactBaseURLOrDefault returns the base URL for artifact download links,
+// deriving it from the HTTP address when not set explicitly and stripping any
+// trailing slash so URL joining never produces a double slash. It returns ""
+// when neither an explicit base nor the HTTP transport is configured.
+func (c *Config) ArtifactBaseURLOrDefault() string {
+	if c.ArtifactBaseURL != "" {
+		return strings.TrimSuffix(c.ArtifactBaseURL, "/")
+	}
+
+	if !c.HTTPEnabled() {
+		return ""
+	}
+
+	// A wildcard bind is not a fetchable destination, but it is reachable on
+	// loopback, so derive the loopback URL rather than an unusable 0.0.0.0 one.
+	host := c.HTTPHost
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+
+	return "http://" + net.JoinHostPort(host, c.HTTPPort)
 }
 
 // HTTPAddr returns the host:port address for the HTTP server.
