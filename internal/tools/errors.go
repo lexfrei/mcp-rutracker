@@ -25,9 +25,12 @@ var ErrRutracker = errors.New("rutracker request error")
 // which a well-behaved client never does but the interface does not forbid.
 var ErrEmptyResponse = errors.New("rutracker returned no data")
 
-// ErrNoDownloadDir is returned when saveToDisk is requested but no download
-// directory is configured.
-var ErrNoDownloadDir = errors.New("saveToDisk requires RUTRACKER_DOWNLOAD_DIR to be set")
+// ErrInvalidMode is returned when an unknown download mode is requested.
+var ErrInvalidMode = errors.New("mode must be one of: metadata, base64, artifact")
+
+// ErrArtifactUnavailable is returned when the artifact mode is requested but the
+// HTTP transport that serves download URLs is not enabled.
+var ErrArtifactUnavailable = errors.New("artifact mode requires the HTTP transport (set MCP_HTTP_PORT)")
 
 // validationErr marks an error as a validation error.
 func validationErr(err error) error {

@@ -2,46 +2,53 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
-	"os"
-	"path/filepath"
+	"encoding/hex"
+	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/lexfrei/mcp-rutracker/internal/artifact"
 	"github.com/lexfrei/mcp-rutracker/internal/rutracker"
 	"github.com/lexfrei/mcp-rutracker/internal/torrentmeta"
 )
 
-// File permissions for a saved .torrent and its directory.
+// Download delivery modes.
 const (
-	downloadDirPerm  = 0o755
-	downloadFilePerm = 0o644
+	modeMetadata = "metadata"
+	modeBase64   = "base64"
+	modeArtifact = "artifact"
 )
 
 // DownloadParams defines the parameters for the rutracker_download tool.
 type DownloadParams struct {
-	TopicID    int   `json:"topicId"              jsonschema:"Topic ID (from a search result)"`
-	SaveToDisk *bool `json:"saveToDisk,omitempty" jsonschema:"Also write the .torrent to the configured download directory"`
+	TopicID int    `json:"topicId"        jsonschema:"Topic ID (from a search result)"`
+	Mode    string `json:"mode,omitempty" jsonschema:"How to deliver the .torrent: 'metadata' (info only), 'base64' (inline content for piping to a torrent client), or 'artifact' (a one-time download URL; requires the HTTP transport). Default: artifact when HTTP is enabled, otherwise metadata."`
 }
 
-// DownloadResult is the output of the rutracker_download tool. The base64
-// content is directly compatible with the transmission_torrent_add metainfo
-// parameter of a sibling Transmission MCP server.
+// DownloadResult is the output of the rutracker_download tool. Metadata fields
+// are always present; the content is delivered inline (base64) or via a
+// one-time download URL (artifact) depending on the mode.
 type DownloadResult struct {
-	Filename       string `json:"filename"`
-	ContentBase64  string `json:"contentBase64"`
-	SizeBytes      int    `json:"sizeBytes"`
-	InfoHash       string `json:"infoHash,omitempty"`
-	FileCount      int    `json:"fileCount,omitempty"`
-	TotalSizeBytes int64  `json:"totalSizeBytes,omitempty"`
-	SavedPath      string `json:"savedPath,omitempty"`
+	Filename       string    `json:"filename"`
+	SizeBytes      int       `json:"sizeBytes"`
+	SHA256         string    `json:"sha256"`
+	InfoHash       string    `json:"infoHash,omitempty"`
+	FileCount      int       `json:"fileCount,omitempty"`
+	TotalSizeBytes int64     `json:"totalSizeBytes,omitempty"`
+	ContentBase64  string    `json:"contentBase64,omitempty"`
+	ArtifactID     string    `json:"artifactId,omitempty"`
+	DownloadURL    string    `json:"downloadUrl,omitempty"`
+	ExpiresAt      time.Time `json:"expiresAt,omitzero"`
 }
 
 // DownloadTool returns the MCP tool definition for rutracker_download.
 func DownloadTool() *mcp.Tool {
 	return &mcp.Tool{
 		Name:        "rutracker_download",
-		Description: "Download a topic's .torrent file as base64, enriched with the contained file list and info-hash; optionally save it to disk",
+		Description: "Fetch a topic's .torrent, enriched with its file list and info-hash. Returns a one-time download URL (HTTP mode) or metadata (stdio) by default; set mode=base64 for inline content",
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Download Torrent",
 			DestructiveHint: ptrBool(false),
@@ -50,9 +57,14 @@ func DownloadTool() *mcp.Tool {
 	}
 }
 
-// NewDownloadHandler creates a handler for the rutracker_download tool. Saved
-// files are written under downloadDir when saveToDisk is requested.
-func NewDownloadHandler(client rutracker.Client, downloadDir string) mcp.ToolHandlerFor[DownloadParams, DownloadResult] {
+// NewDownloadHandler creates a handler for the rutracker_download tool. In
+// artifact mode the .torrent is stored and served once from artifactBaseURL.
+func NewDownloadHandler(
+	client rutracker.Client,
+	store *artifact.Store,
+	artifactBaseURL string,
+	httpEnabled bool,
+) mcp.ToolHandlerFor[DownloadParams, DownloadResult] {
 	return func(
 		ctx context.Context,
 		_ *mcp.CallToolRequest,
@@ -62,30 +74,84 @@ func NewDownloadHandler(client rutracker.Client, downloadDir string) mcp.ToolHan
 			return &mcp.CallToolResult{IsError: true}, DownloadResult{}, validationErr(ErrTopicIDRequired)
 		}
 
+		mode, modeErr := resolveMode(params.Mode, httpEnabled)
+		if modeErr != nil {
+			return &mcp.CallToolResult{IsError: true}, DownloadResult{}, validationErr(modeErr)
+		}
+
+		if mode == modeArtifact && !httpEnabled {
+			return &mcp.CallToolResult{IsError: true}, DownloadResult{}, validationErr(ErrArtifactUnavailable)
+		}
+
 		file, err := client.DownloadTorrent(ctx, params.TopicID)
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, DownloadResult{}, rutrackerErr("download failed", err)
 		}
 
+		sum := sha256.Sum256(file.Content)
 		result := DownloadResult{
-			Filename:      file.Filename,
-			ContentBase64: base64.StdEncoding.EncodeToString(file.Content),
-			SizeBytes:     file.SizeBytes,
+			Filename:  file.Filename,
+			SizeBytes: file.SizeBytes,
+			SHA256:    hex.EncodeToString(sum[:]),
 		}
 
 		enrichWithMeta(&result, file.Content)
 
-		if deref(params.SaveToDisk) {
-			saved, saveErr := saveTorrent(downloadDir, file)
-			if saveErr != nil {
-				return &mcp.CallToolResult{IsError: true}, DownloadResult{}, saveErr
-			}
-
-			result.SavedPath = saved
+		deliverErr := deliver(&result, mode, store, artifactBaseURL, file)
+		if deliverErr != nil {
+			return &mcp.CallToolResult{IsError: true}, DownloadResult{}, deliverErr
 		}
 
 		return nil, result, nil
 	}
+}
+
+// resolveMode validates the requested mode and applies the adaptive default:
+// artifact when the HTTP transport is enabled, otherwise metadata.
+func resolveMode(raw string, httpEnabled bool) (string, error) {
+	switch raw {
+	case "":
+		if httpEnabled {
+			return modeArtifact, nil
+		}
+
+		return modeMetadata, nil
+	case modeMetadata, modeBase64, modeArtifact:
+		return raw, nil
+	default:
+		return "", errors.Wrapf(ErrInvalidMode, "%q", raw)
+	}
+}
+
+// deliver fills the mode-specific output fields (inline base64 or a one-time
+// artifact URL); metadata mode adds nothing beyond the common fields.
+func deliver(
+	result *DownloadResult,
+	mode string,
+	store *artifact.Store,
+	artifactBaseURL string,
+	file *rutracker.TorrentFile,
+) error {
+	switch mode {
+	case modeBase64:
+		result.ContentBase64 = base64.StdEncoding.EncodeToString(file.Content)
+	case modeArtifact:
+		art, putErr := store.Put(file.Filename, file.Content)
+		if putErr != nil {
+			return rutrackerErr("store artifact", putErr)
+		}
+
+		result.ArtifactID = art.Token
+		result.DownloadURL = artifactBaseURL + "/artifacts/" + art.Token
+		result.ExpiresAt = art.ExpiresAt
+	case modeMetadata:
+	default:
+		// Unreachable: resolveMode validates the mode first. The arm makes the
+		// invariant self-defending if a new mode is ever added.
+		return rutrackerErr("deliver", errors.Wrapf(ErrInvalidMode, "%q", mode))
+	}
+
+	return nil
 }
 
 // enrichWithMeta decodes the torrent bytes and fills in the file count, total
@@ -99,26 +165,4 @@ func enrichWithMeta(result *DownloadResult, content []byte) {
 	result.InfoHash = meta.InfoHash
 	result.FileCount = meta.FileCount
 	result.TotalSizeBytes = meta.TotalSizeBytes
-}
-
-// saveTorrent writes the .torrent to downloadDir, sanitising the filename to a
-// base name to prevent path traversal.
-func saveTorrent(downloadDir string, file *rutracker.TorrentFile) (string, error) {
-	if downloadDir == "" {
-		return "", validationErr(ErrNoDownloadDir)
-	}
-
-	path := filepath.Join(downloadDir, filepath.Base(file.Filename))
-
-	mkErr := os.MkdirAll(downloadDir, downloadDirPerm)
-	if mkErr != nil {
-		return "", rutrackerErr("create download directory", mkErr)
-	}
-
-	writeErr := os.WriteFile(path, file.Content, downloadFilePerm)
-	if writeErr != nil {
-		return "", rutrackerErr("write torrent file", writeErr)
-	}
-
-	return path, nil
 }

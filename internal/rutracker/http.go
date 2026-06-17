@@ -17,8 +17,7 @@ import (
 // defaultUserAgent mimics a recent desktop Chrome to reduce anti-bot friction.
 // rutracker rejects requests from obviously scripted clients, so a realistic
 // User-Agent is the cheapest mitigation short of full TLS impersonation.
-const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 // Doer is the subset of *http.Client the scraper relies on. Hiding the
 // transport behind an interface lets callers swap in a TLS-impersonating
