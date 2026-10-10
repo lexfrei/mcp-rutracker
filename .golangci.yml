@@ -5,8 +5,10 @@ linters:
   disable:
     - depguard
     - exhaustruct
+    - exhaustruct_v5
     - gochecknoinits
     - wsl
+    - wsl_v5
     - lll
     - errchkjson
     - ireturn
